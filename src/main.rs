@@ -1,14 +1,13 @@
-use nix::mount::{mount, MsFlags};
+use nix::mount::{mount, umount, MsFlags};
 use nix::sched::{unshare, CloneFlags};
-use nix::sys::signal::{kill, Signal};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd;
-use nix::unistd::{fork, ForkResult};
 use std::env;
 use std::fs;
+use std::fs::Permissions;
 use std::io;
 use std::io::prelude::*;
 use std::os::unix::fs::symlink;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -88,73 +87,17 @@ fn bind_mount_direntry(entry: io::Result<fs::DirEntry>) {
     }
 }
 
-fn run_chroot(nixdir: &Path, rootdir: &Path, cmd: &str, args: &[String]) {
+fn run_chroot(nixdir: &Path, cmd: &str, args: &[String]) {
+    let tempdir = TempDir::new().expect("failed to create temporary directory for mount point");
+    let rootdir = PathBuf::from(tempdir.path());
+
     let cwd = env::current_dir().expect("cannot get current working directory");
 
     let uid = unistd::getuid();
     let gid = unistd::getgid();
-
-    unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUSER).expect("unshare failed");
-
-    // prepare pivot_root call:
-    // rootdir must be a mount point
-
-    mount(
-        Some(rootdir),
-        rootdir,
-        Some("none"),
-        MsFlags::MS_BIND | MsFlags::MS_REC,
-        NONE,
-    )
-    .expect("failed to re-bind mount / to our new chroot");
-
-    mount(
-        Some(rootdir),
-        rootdir,
-        Some("none"),
-        MsFlags::MS_PRIVATE | MsFlags::MS_REC,
-        NONE,
-    ).expect("failed to re-mount our chroot as private mount");
-
-    // create the mount point for the old root
-    // The old root cannot be unmounted/removed after pivot_root, the only way to
-    // keep / clean is to hide the directory with another mountpoint. Therefore
-    // we pivot the old root to /nix. This is somewhat confusing, though.
-    let nix_mountpoint = rootdir.join("nix");
-    fs::create_dir(&nix_mountpoint)
-        .unwrap_or_else(|_| panic!("failed to create {}/nix", &nix_mountpoint.display()));
-
-    unistd::pivot_root(rootdir, &nix_mountpoint).unwrap_or_else(|_| {
-        panic!(
-            "pivot_root({},{})",
-            rootdir.display(),
-            nix_mountpoint.display()
-        )
-    });
-
-    env::set_current_dir("/").expect("cannot change directory to /");
-
-    // bind mount all / stuff into rootdir
-    // the orginal content of / now available under /nix
-    let nix_root = PathBuf::from("/nix");
-    let dir = fs::read_dir(&nix_root).expect("failed to list /nix directory");
-    for entry in dir {
-        bind_mount_direntry(entry);
-    }
-    // mount the store and hide the old root
-    // we fetch nixdir under the old root
-    let nix_store = nix_root.join(nixdir);
-    mount(
-        Some(&nix_store),
-        "/nix",
-        Some("none"),
-        MsFlags::MS_BIND | MsFlags::MS_REC,
-        NONE,
-    )
-    .unwrap_or_else(|_| panic!("failed to bind mount {} to /nix", nix_store.display()));
-
     // fixes issue #1 where writing to /proc/self/gid_map fails
     // see user_namespaces(7) for more documentation
+    unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUSER).expect("unshare failed");
     if let Ok(mut file) = fs::File::create("/proc/self/setgroups") {
         let _ = file.write_all(b"deny");
     }
@@ -171,61 +114,163 @@ fn run_chroot(nixdir: &Path, rootdir: &Path, cmd: &str, args: &[String]) {
         .write_all(format!("{} {} 1", gid, gid).as_bytes())
         .expect("failed to write new gid mapping to /proc/self/gid_map");
 
+    // prepare pivot_root call:
+    // rootdir must be a mount point
+
+    mount(
+        Some("/"),
+        "/",
+        Some("none"),
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        NONE,
+    )
+    .unwrap();
+
+    mount(
+        Some("none"),
+        "/",
+        Some("none"),
+        MsFlags::MS_PRIVATE | MsFlags::MS_REC,
+        NONE,
+    )
+    .unwrap();
+
+    mount(
+        Some("none"),
+        &rootdir,
+        Some("tmpfs"),
+        MsFlags::empty(),
+        NONE,
+    )
+    .unwrap();
+
+    fs::set_permissions(&rootdir, Permissions::from_mode(0o755)).unwrap();
+
+    // create the mount point for the old root
+    // The old root cannot be unmounted/removed after pivot_root, the only way to
+    // keep / clean is to hide the directory with another mountpoint. Therefore
+    // we pivot the old root to /nix. This is somewhat confusing, though.
+    let nix_mountpoint = rootdir.join("nix");
+    fs::create_dir(&nix_mountpoint).unwrap();
+
+    unistd::pivot_root(&rootdir, &nix_mountpoint).unwrap();
+    env::set_current_dir("/").expect("cannot change directory to /");
+
+    // bind mount all / stuff into rootdir
+    // the orginal content of / now available under /nix
+    let nix_root = PathBuf::from("/nix");
+    let dir = fs::read_dir(&nix_root).expect("failed to list /nix directory");
+    for entry in dir {
+        bind_mount_direntry(entry);
+    }
+
+    if PathBuf::from("/nix/nix/store").exists() {
+        let tmp = TempDir::new().unwrap();
+        mount(
+            Some("/nix/nix"),
+            "/nix",
+            Some("none"),
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            NONE,
+        )
+        .unwrap();
+        mount(
+            Some("/nix/store"),
+            tmp.path(),
+            Some("none"),
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            NONE,
+        )
+        .unwrap();
+        mount(
+            Some("none"),
+            "/nix/store",
+            Some("tmpfs"),
+            MsFlags::empty(),
+            NONE,
+        )
+        .unwrap();
+        fs::set_permissions("/nix/store", Permissions::from_mode(0o755)).unwrap();
+        let sroot = PathBuf::from("/nix/store");
+        for entry in fs::read_dir(&nixdir).unwrap() {
+            let entry = entry.unwrap();
+            let stat = entry.metadata().unwrap();
+            let name = entry.file_name();
+            let path = sroot.join(&name);
+            let store_path = entry.path();
+            if stat.is_dir() {
+                fs::create_dir(&path).unwrap();
+            } else if stat.is_file() {
+                fs::File::create(&path).unwrap();
+            } else if stat.file_type().is_symlink() {
+                let target = fs::read_link(&store_path).unwrap();
+                symlink(&target, &path).unwrap();
+            }
+            if stat.is_dir() || stat.is_file() {
+                mount(
+                    Some(&store_path),
+                    &path,
+                    Some("none"),
+                    MsFlags::MS_BIND | MsFlags::MS_REC,
+                    NONE,
+                )
+                .unwrap();
+            }
+        }
+        if let Ok(iter) = fs::read_dir(tmp.path()) {
+            for entry in iter {
+                let entry = entry.unwrap();
+                let name = entry.file_name();
+                let path = sroot.join(&name);
+                if path.exists() {
+                    continue;
+                }
+                let stat = entry.metadata().unwrap();
+                let store_path = entry.path();
+                if stat.is_dir() {
+                    fs::create_dir(&path).unwrap();
+                } else if stat.is_file() {
+                    fs::File::create(&path).unwrap();
+                } else if stat.file_type().is_symlink() {
+                    let target = fs::read_link(&store_path).unwrap();
+                    symlink(&target, &path).unwrap();
+                }
+                if stat.is_dir() || stat.is_file() {
+                    mount(
+                        Some(&store_path),
+                        &path,
+                        Some("none"),
+                        MsFlags::MS_BIND | MsFlags::MS_REC,
+                        NONE,
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        umount(tmp.path()).unwrap();
+    } else {
+        mount(Some("none"), "/nix", Some("tmpfs"), MsFlags::empty(), NONE).unwrap();
+        fs::set_permissions("/nix", Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir_all("/nix/store").unwrap();
+        mount(
+            Some(nixdir),
+            "/nix/store",
+            Some("none"),
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            NONE,
+        )
+        .unwrap();
+    }
+
     // restore cwd
     env::set_current_dir(&cwd)
         .unwrap_or_else(|_| panic!("cannot restore working directory {}", cwd.display()));
+    tempdir.close().unwrap();
 
-    let err = process::Command::new(cmd)
-        .args(args)
-        .env("NIX_CONF_DIR", "/nix/etc/nix")
-        .exec();
+    let err = process::Command::new(cmd).args(args).exec();
 
     eprintln!("failed to execute {}: {}", &cmd, err);
     process::exit(1);
-}
-
-fn wait_for_child(child_pid: unistd::Pid, tempdir: TempDir, rootdir: &Path) {
-    loop {
-        match waitpid(child_pid, Some(WaitPidFlag::WUNTRACED)) {
-            Ok(WaitStatus::Signaled(child, Signal::SIGSTOP, _)) => {
-                let _ = kill(unistd::getpid(), Signal::SIGSTOP);
-                let _ = kill(child, Signal::SIGCONT);
-            }
-            Ok(WaitStatus::Signaled(_, signal, _)) => {
-                kill(unistd::getpid(), signal)
-                    .unwrap_or_else(|_| panic!("failed to send {} signal to our self", signal));
-            }
-            Ok(WaitStatus::Exited(_, status)) => {
-                tempdir.close().unwrap_or_else(|_| {
-                    panic!(
-                        "failed to remove temporary directory: {}",
-                        rootdir.display()
-                    )
-                });
-                process::exit(status);
-            }
-            Ok(what) => {
-                tempdir.close().unwrap_or_else(|_| {
-                    panic!(
-                        "failed to remove temporary directory: {}",
-                        rootdir.display()
-                    )
-                });
-                eprintln!("unexpected wait event happend: {:?}", what);
-                process::exit(1);
-            }
-            Err(e) => {
-                tempdir.close().unwrap_or_else(|_| {
-                    panic!(
-                        "failed to remove temporary directory: {}",
-                        rootdir.display()
-                    )
-                });
-                eprintln!("waitpid failed: {}", e);
-                process::exit(1);
-            }
-        };
-    }
 }
 
 fn main() {
@@ -234,18 +279,8 @@ fn main() {
         eprintln!("Usage: {} <nixpath> <command>\n", args[0]);
         process::exit(1);
     }
-    let tempdir =
-        TempDir::new().expect("failed to create temporary directory for mount point");
-    let rootdir = PathBuf::from(tempdir.path());
-
     let nixdir = fs::canonicalize(&args[1])
         .unwrap_or_else(|_| panic!("failed to resolve nix directory {}", &args[1]));
 
-    match fork() {
-        Ok(ForkResult::Parent { child, .. }) => wait_for_child(child, tempdir, &rootdir),
-        Ok(ForkResult::Child) => run_chroot(&nixdir, &rootdir, &args[2], &args[3..]),
-        Err(e) => {
-            eprintln!("fork failed: {}", e);
-        }
-    };
+    run_chroot(&nixdir, &args[2], &args[3..]);
 }
