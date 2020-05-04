@@ -15,6 +15,40 @@ use std::process;
 use std::string::String;
 use tempfile::TempDir;
 
+struct WrapUmount {
+    dir: TempDir,
+    defused: bool,
+}
+
+impl Drop for WrapUmount {
+    fn drop(&mut self) {
+        if !self.defused {
+            umount(self.dir.path()).unwrap();
+        }
+    }
+}
+
+impl std::ops::Deref for WrapUmount {
+    type Target = TempDir;
+
+    fn deref(&self) -> &Self::Target {
+        &self.dir
+    }
+}
+
+impl WrapUmount {
+    fn defuse(&mut self) {
+        self.defused = true;
+    }
+
+    fn new(dir: TempDir) -> Self {
+        Self {
+            dir,
+            defused: false,
+        }
+    }
+}
+
 const NONE: Option<&'static [u8]> = None;
 
 fn bind_mount(source: &Path, dest: &Path) {
@@ -89,6 +123,7 @@ fn bind_mount_direntry(entry: io::Result<fs::DirEntry>) {
 
 fn run_chroot(nixdir: &Path, cmd: &str, args: &[String]) {
     let tempdir = TempDir::new().expect("failed to create temporary directory for mount point");
+    let mut tempdir = WrapUmount::new(tempdir);
     let rootdir = PathBuf::from(tempdir.path());
 
     let cwd = env::current_dir().expect("cannot get current working directory");
@@ -154,6 +189,7 @@ fn run_chroot(nixdir: &Path, cmd: &str, args: &[String]) {
     fs::create_dir(&nix_mountpoint).unwrap();
 
     unistd::pivot_root(&rootdir, &nix_mountpoint).unwrap();
+    tempdir.defuse();
     env::set_current_dir("/").expect("cannot change directory to /");
 
     // bind mount all / stuff into rootdir
@@ -163,9 +199,9 @@ fn run_chroot(nixdir: &Path, cmd: &str, args: &[String]) {
     for entry in dir {
         bind_mount_direntry(entry);
     }
-
+    drop(tempdir);
     if PathBuf::from("/nix/nix/store").exists() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = WrapUmount::new(TempDir::new().unwrap());
         mount(
             Some("/nix/nix"),
             "/nix",
@@ -247,7 +283,14 @@ fn run_chroot(nixdir: &Path, cmd: &str, args: &[String]) {
                 }
             }
         }
-        umount(tmp.path()).unwrap();
+        mount(
+            Some("none"),
+            "/nix/store",
+            Some("none"),
+            MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+            NONE,
+        )
+        .unwrap();
     } else {
         mount(Some("none"), "/nix", Some("tmpfs"), MsFlags::empty(), NONE).unwrap();
         fs::set_permissions("/nix", Permissions::from_mode(0o755)).unwrap();
@@ -265,7 +308,6 @@ fn run_chroot(nixdir: &Path, cmd: &str, args: &[String]) {
     // restore cwd
     env::set_current_dir(&cwd)
         .unwrap_or_else(|_| panic!("cannot restore working directory {}", cwd.display()));
-    tempdir.close().unwrap();
 
     let err = process::Command::new(cmd).args(args).exec();
 
