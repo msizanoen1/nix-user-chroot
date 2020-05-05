@@ -223,10 +223,9 @@ fn run_chroot(nixdir: &Path, cmd: &str, args: &[String]) {
             "/nix/store",
             Some("tmpfs"),
             MsFlags::empty(),
-            NONE,
+            Some("mode=0755"),
         )
         .unwrap();
-        fs::set_permissions("/nix/store", Permissions::from_mode(0o755)).unwrap();
         let sroot = PathBuf::from("/nix/store");
         for entry in fs::read_dir(&nixdir).unwrap() {
             let entry = entry.unwrap();
@@ -292,8 +291,14 @@ fn run_chroot(nixdir: &Path, cmd: &str, args: &[String]) {
         )
         .unwrap();
     } else {
-        mount(Some("none"), "/nix", Some("tmpfs"), MsFlags::empty(), NONE).unwrap();
-        fs::set_permissions("/nix", Permissions::from_mode(0o755)).unwrap();
+        mount(
+            Some("none"),
+            "/nix",
+            Some("tmpfs"),
+            MsFlags::empty(),
+            Some("mode=0755"),
+        )
+        .unwrap();
         fs::create_dir_all("/nix/store").unwrap();
         mount(
             Some(nixdir),
